@@ -184,55 +184,69 @@ export const useBookingStore = create<BookingState>((set, get) => ({
       } catch (e) {
         // network skip
       }
-    }, 1500);
+    }, 1000);
 
     return () => clearInterval(interval);
   },
 
+  // Xử lý Race Condition & Conflict Prevention triệt để
   bookSlot: async (roomId, slotId) => {
     const { userSession } = get();
 
     try {
+      // 1. Lấy toàn bộ danh sách phòng hiện tại từ Firebase
       const res = await fetch(`${FIREBASE_DB_URL}rooms.json`);
       const currentRooms: StudyRoom[] = await res.json();
 
-      const targetRoom = currentRooms.find((r) => r.id === roomId);
-      if (!targetRoom) return { success: false, message: 'Phòng không tồn tại!' };
+      const roomIndex = currentRooms.findIndex((r) => r.id === roomId);
+      if (roomIndex === -1) return { success: false, message: 'Phòng không tồn tại!' };
 
-      const targetSlot = targetRoom.availableSlots.find((s) => s.id === slotId);
-      if (!targetSlot) return { success: false, message: 'Khung giờ không tồn tại!' };
+      const slotIndex = currentRooms[roomIndex].availableSlots.findIndex((s) => s.id === slotId);
+      if (slotIndex === -1) return { success: false, message: 'Khung giờ không tồn tại!' };
 
-      // Chống trùng lịch (Conflict Prevention)
-      if (targetSlot.isBooked) {
+      // 2. Atomic Verification: Đọc trực tiếp slot đích từ server
+      const slotCheckRes = await fetch(
+        `${FIREBASE_DB_URL}rooms/${roomIndex}/availableSlots/${slotIndex}.json`
+      );
+      const serverSlot = await slotCheckRes.json();
+
+      // Nếu slot trên server đã bị người khác book trước đó
+      if (serverSlot && serverSlot.isBooked) {
+        // Cập nhật lại state cục bộ ngay lập tức để sync UI
         set({ rooms: currentRooms });
         return {
           success: false,
-          message: 'Khung giờ này vừa có người khác đặt trước bạn vài giây!',
+          message: `Xung đột: Khung giờ này vừa được đặt bởi ${serverSlot.bookedBy || 'sinh viên khác'}.`,
         };
       }
 
-      const updatedRooms = currentRooms.map((room) =>
-        room.id === roomId
-          ? {
-              ...room,
-              availableSlots: room.availableSlots.map((slot) =>
-                slot.id === slotId
-                  ? { ...slot, isBooked: true, bookedBy: userSession.userId }
-                  : slot
-              ),
-            }
-          : room
+      // 3. Thực hiện ghi trực tiếp vào đường dẫn slot cụ thể (chỉ cập nhật trường của slot đó)
+      const updatePayload = {
+        ...serverSlot,
+        isBooked: true,
+        bookedBy: userSession.userId,
+      };
+
+      const putRes = await fetch(
+        `${FIREBASE_DB_URL}rooms/${roomIndex}/availableSlots/${slotIndex}.json`,
+        {
+          method: 'PUT',
+          body: JSON.stringify(updatePayload),
+        }
       );
 
-      await fetch(`${FIREBASE_DB_URL}rooms.json`, {
-        method: 'PUT',
-        body: JSON.stringify(updatedRooms),
-      });
+      if (!putRes.ok) {
+        return { success: false, message: 'Lỗi khi gửi yêu cầu đặt chỗ đến server!' };
+      }
 
+      // 4. Cập nhật state nội bộ
+      const updatedRooms = [...currentRooms];
+      updatedRooms[roomIndex].availableSlots[slotIndex] = updatePayload;
       set({ rooms: updatedRooms });
+
       return { success: true, message: 'Đặt phòng thành công!' };
     } catch (error) {
-      return { success: false, message: 'Lỗi kết nối máy chủ!' };
+      return { success: false, message: 'Lỗi mạng: Không thể xác thực đặt chỗ!' };
     }
   },
 
@@ -243,32 +257,39 @@ export const useBookingStore = create<BookingState>((set, get) => ({
       const res = await fetch(`${FIREBASE_DB_URL}rooms.json`);
       const currentRooms: StudyRoom[] = await res.json();
 
-      const targetRoom = currentRooms.find((r) => r.id === roomId);
-      const targetSlot = targetRoom?.availableSlots.find((s) => s.id === slotId);
+      const roomIndex = currentRooms.findIndex((r) => r.id === roomId);
+      if (roomIndex === -1) return { success: false, message: 'Phòng không tồn tại!' };
 
-      if (!targetSlot || !targetSlot.isBooked || targetSlot.bookedBy !== userSession.userId) {
+      const slotIndex = currentRooms[roomIndex].availableSlots.findIndex((s) => s.id === slotId);
+      if (slotIndex === -1) return { success: false, message: 'Khung giờ không tồn tại!' };
+
+      const slot = currentRooms[roomIndex].availableSlots[slotIndex];
+      if (!slot.isBooked || slot.bookedBy !== userSession.userId) {
         return { success: false, message: 'Bạn không có quyền hủy lịch này.' };
       }
 
-      const updatedRooms = currentRooms.map((room) =>
-        room.id === roomId
-          ? {
-              ...room,
-              availableSlots: room.availableSlots.map((slot) =>
-                slot.id === slotId
-                  ? { ...slot, isBooked: false, bookedBy: undefined }
-                  : slot
-              ),
-            }
-          : room
+      const resetPayload = {
+        ...slot,
+        isBooked: false,
+        bookedBy: null,
+      };
+
+      await fetch(
+        `${FIREBASE_DB_URL}rooms/${roomIndex}/availableSlots/${slotIndex}.json`,
+        {
+          method: 'PUT',
+          body: JSON.stringify(resetPayload),
+        }
       );
 
-      await fetch(`${FIREBASE_DB_URL}rooms.json`, {
-        method: 'PUT',
-        body: JSON.stringify(updatedRooms),
-      });
-
+      const updatedRooms = [...currentRooms];
+      updatedRooms[roomIndex].availableSlots[slotIndex] = {
+        ...slot,
+        isBooked: false,
+        bookedBy: undefined,
+      };
       set({ rooms: updatedRooms });
+
       return { success: true, message: 'Đã hủy lịch đặt thành công!' };
     } catch (e) {
       return { success: false, message: 'Lỗi kết nối khi hủy lịch.' };
